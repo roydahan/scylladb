@@ -26,7 +26,7 @@ from cassandra import ConsistencyLevel, Unavailable
 from cassandra.cluster import NoHostAvailable
 from cassandra.query import SimpleStatement
 
-from test.cluster.util import new_test_keyspace
+from test.cluster.util import new_test_keyspace, reconnect_driver, wait_for_cql_and_get_hosts
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
 from test.pylib.util import wait_for
 
@@ -148,6 +148,9 @@ async def test_logged_batch_endpoints_over_four_racks(manager: ScyllaClusterMana
         for s in servers[1:]:
             await manager.server_start(s.server_id)
         await manager.servers_see_each_other(servers)
+        # The default driver session saw the nodes go down, reconnect it before dropping the keyspace.
+        cql = await reconnect_driver(manager)
+        await wait_for_cql_and_get_hosts(cql, servers, time.time() + 60)
 
 
 async def test_lwt_remote_paxos_handlers_are_traced(manager: ScyllaClusterManager) -> None:
@@ -179,7 +182,7 @@ async def test_lwt_remote_paxos_handlers_are_traced(manager: ScyllaClusterManage
             if stmt.query_string.startswith("SELECT"):
                 assert res.one().v == 2
             else:
-                assert res.one().applied, f"'{stmt.query_string}' was not applied"
+                assert res.was_applied, f"'{stmt.query_string}' was not applied"
             session_ids.append(res.response_future.get_query_trace_ids()[0])
 
         # The conditional writes run all the Paxos phases on every replica.
@@ -243,8 +246,8 @@ async def test_batch_writes_aborted_on_graceful_stop(manager: ScyllaClusterManag
             assert not any(f.done() for f in futures)
 
             stop = asyncio.create_task(manager.server_stop_gracefully(coordinator.server_id))
-            await log.wait_for("Asked to drain", from_mark=mark, timeout=120)
-            await log.wait_for("Drained", from_mark=mark, timeout=120)
+            await log.wait_for("batchlog_manager - Asked to drain", from_mark=mark, timeout=120)
+            await log.wait_for("batchlog_manager - Drained", from_mark=mark, timeout=120)
         finally:
             # Let the blocked local writes finish, so the database drain doesn't wait for them.
             try:
@@ -262,3 +265,5 @@ async def test_batch_writes_aborted_on_graceful_stop(manager: ScyllaClusterManag
 
         await manager.server_start(coordinator.server_id)
         await manager.servers_see_each_other(servers)
+        cql = await reconnect_driver(manager)
+        await wait_for_cql_and_get_hosts(cql, servers, time.time() + 60)
