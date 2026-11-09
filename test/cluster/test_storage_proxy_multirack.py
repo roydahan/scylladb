@@ -200,59 +200,76 @@ async def test_lwt_remote_paxos_handlers_are_traced(manager: ScyllaClusterManage
 
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_batch_writes_aborted_on_graceful_stop(manager: ScyllaClusterManager) -> None:
-    """A graceful stop of a coordinator with logged batch writes still in
-    flight in the background: the batchlog manager drain must abort them
-    (storage_proxy::abort_batch_writes).
+    """A graceful stop of a node while writes of its batchlog replay are still
+    in flight: the batchlog manager drain must abort them
+    (storage_proxy::abort_batch_writes cancels the cancellable handlers of
+    write type BATCH, which are the replay writes).
 
-    The coordinator's own apply of the batch mutations is blocked with an
-    error injection, while the other two replicas acknowledge. At CL=QUORUM
-    the clients get their response, but every batch write handler stays alive
-    waiting for its local target. Such handlers don't hold the CQL server
-    shutdown, survive cancel_nonlocal_write_response_handlers() (they have no
-    pending remote target) and don't time out by themselves (the write timeout
-    is long), so they are cancelled when the batchlog manager is drained.
-    More than max_cancellations_per_yield (256) handlers make the cancellation
-    loop yield with an iterator guard.
+    1. Write logged batches from node A while failing the removal of their
+       batchlog entries, so the entries stay on the batchlog endpoints B and C.
+    2. Let only B replay them, with B's own apply of the replayed mutations
+       blocked by an error injection. A and C acknowledge, so each replay
+       write reaches EACH_QUORUM and the replay goes on, but its handler stays
+       alive, waiting for the local target. Such handlers survive
+       cancel_nonlocal_write_response_handlers() (no pending remote target)
+       and don't time out by themselves (replay writes have a 300s timeout).
+    3. Stop B gracefully: the batchlog manager drain cancels them. More than
+       max_cancellations_per_yield (256) handlers make the cancellation loop
+       yield with an iterator guard.
     """
-    coordinator_config = {"write_request_timeout_in_ms": 600000}
-    # A single shard, so that all the batch write handlers are in one storage_proxy.
-    cmdline = ["--smp", "1"]
+    # A single shard, so that all the replay write handlers are in one storage_proxy.
+    cmdline = ["--smp", "1", "--logger-log-level", "batchlog_manager=debug"]
+    config = {"error_injections_at_startup": ["short_batchlog_manager_replay_interval"]}
     racks = [{"dc": "dc1", "rack": f"rack{i}"} for i in range(3)]
-    coordinator = await manager.server_add(cmdline=cmdline, config=coordinator_config, property_file=racks[0])
-    servers = [coordinator] + await manager.servers_add(2, cmdline=cmdline, property_file=racks[1:])
+    servers = await manager.servers_add(3, cmdline=cmdline, config=config, property_file=racks)
+    node_a, node_b, node_c = servers
+    cql = manager.get_cql()
 
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3}") as ks:
-        await manager.get_cql().run_async(f"CREATE TABLE {ks}.tab (pk int, ck int, v int, PRIMARY KEY (pk, ck))")
-        cql = await manager.get_cql_exclusive(coordinator)
-        log = await manager.server_open_log(coordinator.server_id)
-        mark = await log.mark()
+        # A short propagation delay makes batchlog entries old enough to be replayed after a second.
+        await cql.run_async(f"CREATE TABLE {ks}.tab (pk int, ck int, v int, PRIMARY KEY (pk, ck)) "
+                            "WITH tombstone_gc = {'mode': 'repair', 'propagation_delay_in_seconds': '1'}")
 
-        await manager.api.enable_injection(coordinator.ip_addr, "database_apply", one_shot=False,
-                                           parameters={"ks_name": ks, "cf_name": "tab", "what": "wait"})
+        await asyncio.gather(*[manager.api.enable_injection(s.ip_addr, "skip_batch_replay", one_shot=False) for s in servers])
+        await manager.api.enable_injection(node_a.ip_addr, "storage_proxy_fail_remove_from_batchlog", one_shot=False)
+        cql_a = await manager.get_cql_exclusive(node_a)
         nr_batches = 120
         partitions_per_batch = 3
         nr_writes = nr_batches * partitions_per_batch
+        # The batches are written, but the removal of their batchlog entries fails.
+        results = await asyncio.gather(*[cql_a.run_async(SimpleStatement(logged_batch(ks, "tab", b * 10, partitions_per_batch),
+                                                                         consistency_level=ConsistencyLevel.ALL))
+                                         for b in range(nr_batches)], return_exceptions=True)
+        logger.info(f"{sum(isinstance(r, Exception) for r in results)} of {nr_batches} batches failed, "
+                    f"e.g. {next((r for r in results if isinstance(r, Exception)), None)!r}")
+        await manager.api.disable_injection(node_a.ip_addr, "storage_proxy_fail_remove_from_batchlog")
+        rows = await cql.run_async(SimpleStatement("SELECT count(*) FROM system.batchlog_v2",
+                                                   consistency_level=ConsistencyLevel.ONE), host=await host_of(manager, node_b))
+        assert rows[0].count >= nr_batches
+
+        log = await manager.server_open_log(node_b.server_id)
+        mark = await log.mark()
+        await manager.api.enable_injection(node_b.ip_addr, "database_apply", one_shot=False,
+                                           parameters={"ks_name": ks, "cf_name": "tab", "what": "wait"})
+        # A replay write handler cancelled after achieving its CL logs this at trace level.
+        await manager.api.set_logger_level(node_b.ip_addr, "storage_proxy", "trace")
         stop = None
         try:
-            await asyncio.gather(*[cql.run_async(SimpleStatement(logged_batch(ks, "tab", b * 10, partitions_per_batch),
-                                                                 consistency_level=ConsistencyLevel.QUORUM))
-                                   for b in range(nr_batches)])
+            await manager.api.disable_injection(node_b.ip_addr, "skip_batch_replay")
 
-            # Every batch mutation is applied locally, so wait until all of them are blocked.
+            # Every replayed mutation is applied on B too, so wait until all of them are blocked.
             async def all_writes_blocked():
                 blocked = len(await log.grep("database_apply: wait", from_mark=mark))
                 return True if blocked >= nr_writes else None
             await wait_for(all_writes_blocked, time.time() + 120, period=0.5)
 
-            # A write handler cancelled after achieving its CL logs this at trace level.
-            await manager.api.set_logger_level(coordinator.ip_addr, "storage_proxy", "trace")
-            stop = asyncio.create_task(manager.server_stop_gracefully(coordinator.server_id))
+            stop = asyncio.create_task(manager.server_stop_gracefully(node_b.server_id))
             drain_mark, _ = await log.wait_for("batchlog_manager - Asked to drain", from_mark=mark, timeout=120)
             drained_mark, _ = await log.wait_for("batchlog_manager - Drained", from_mark=drain_mark, timeout=120)
         finally:
             # Let the blocked local writes finish, so the database drain doesn't wait for them.
             try:
-                await manager.api.message_injection(coordinator.ip_addr, "database_apply")
+                await manager.api.message_injection(node_b.ip_addr, "database_apply")
             except Exception as e:
                 logger.info(f"Failed to message the injection, the node is probably down: {e}")
             if stop:
@@ -261,10 +278,16 @@ async def test_batch_writes_aborted_on_graceful_stop(manager: ScyllaClusterManag
         # Count the handlers cancelled between "Asked to drain" and "Drained".
         cancelled = "Write is not acknowledged by .* replicas after achieving CL"
         aborted = len(await log.grep(cancelled, from_mark=drain_mark)) - len(await log.grep(cancelled, from_mark=drained_mark))
-        logger.info(f"{aborted} write handlers were aborted by the batchlog manager drain")
+        logger.info(f"{aborted} replay write handlers were aborted by the batchlog manager drain")
         assert aborted >= nr_writes
 
-        await manager.server_start(coordinator.server_id)
+        await manager.server_start(node_b.server_id)
         await manager.servers_see_each_other(servers)
+        await asyncio.gather(*[manager.api.disable_injection(s.ip_addr, "skip_batch_replay") for s in (node_a, node_c)])
         cql = await reconnect_driver(manager)
         await wait_for_cql_and_get_hosts(cql, servers, time.time() + 60)
+
+
+async def host_of(manager: ScyllaClusterManager, server):
+    hosts = await wait_for_cql_and_get_hosts(manager.get_cql(), [server], time.time() + 60)
+    return hosts[0]
