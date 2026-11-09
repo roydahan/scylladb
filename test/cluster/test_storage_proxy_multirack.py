@@ -225,7 +225,11 @@ async def test_batch_writes_aborted_on_graceful_stop(manager: ScyllaClusterManag
     node_a, node_b, node_c = servers
     cql = manager.get_cql()
 
-    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3}") as ks:
+    # SimpleStrategy: replay writes are sent at EACH_QUORUM, and with NetworkTopologyStrategy
+    # make_write_response_handler() creates a datacenter_sync_write_response_handler, which
+    # isn't registered as cancellable, so abort_batch_writes() wouldn't see it.
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3} "
+                                          "AND tablets = {'enabled': false}") as ks:
         # A short propagation delay makes batchlog entries old enough to be replayed after a second.
         await cql.run_async(f"CREATE TABLE {ks}.tab (pk int, ck int, v int, PRIMARY KEY (pk, ck)) "
                             "WITH tombstone_gc = {'mode': 'repair', 'propagation_delay_in_seconds': '1'}")
