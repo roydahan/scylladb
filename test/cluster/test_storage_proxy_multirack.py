@@ -200,24 +200,21 @@ async def test_lwt_remote_paxos_handlers_are_traced(manager: ScyllaClusterManage
 
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_batch_writes_aborted_on_graceful_stop(manager: ScyllaClusterManager) -> None:
-    """A graceful stop of a coordinator with logged batch writes in flight:
-    the batchlog manager drain must abort them (storage_proxy::abort_batch_writes)
-    instead of letting the shutdown wait for them.
+    """A graceful stop of a coordinator with logged batch writes still in
+    flight in the background: the batchlog manager drain must abort them
+    (storage_proxy::abort_batch_writes).
 
     The coordinator's own apply of the batch mutations is blocked with an
-    error injection, while the other two replicas acknowledge, so at CL=ALL
-    every batch write handler stays alive and waits for a local target only.
-    Such handlers survive cancel_nonlocal_write_response_handlers() and the
-    CQL server shutdown (whose wait for in-flight requests is cut short by
-    request_timeout_on_shutdown_in_seconds, while the write timeout is long),
-    and are cancelled when the batchlog manager is drained. More than
-    max_cancellations_per_yield (256) handlers make the cancellation loop
-    yield with an iterator guard.
+    error injection, while the other two replicas acknowledge. At CL=QUORUM
+    the clients get their response, but every batch write handler stays alive
+    waiting for its local target. Such handlers don't hold the CQL server
+    shutdown, survive cancel_nonlocal_write_response_handlers() (they have no
+    pending remote target) and don't time out by themselves (the write timeout
+    is long), so they are cancelled when the batchlog manager is drained.
+    More than max_cancellations_per_yield (256) handlers make the cancellation
+    loop yield with an iterator guard.
     """
-    coordinator_config = {
-        "write_request_timeout_in_ms": 600000,
-        "request_timeout_on_shutdown_in_seconds": 1,
-    }
+    coordinator_config = {"write_request_timeout_in_ms": 600000}
     # A single shard, so that all the batch write handlers are in one storage_proxy.
     cmdline = ["--smp", "1"]
     racks = [{"dc": "dc1", "rack": f"rack{i}"} for i in range(3)]
@@ -234,34 +231,38 @@ async def test_batch_writes_aborted_on_graceful_stop(manager: ScyllaClusterManag
                                            parameters={"ks_name": ks, "cf_name": "tab", "what": "wait"})
         nr_batches = 120
         partitions_per_batch = 3
-        futures = [cql.run_async(SimpleStatement(logged_batch(ks, "tab", b * 10, partitions_per_batch),
-                                                 consistency_level=ConsistencyLevel.ALL))
-                   for b in range(nr_batches)]
+        nr_writes = nr_batches * partitions_per_batch
+        stop = None
         try:
+            await asyncio.gather(*[cql.run_async(SimpleStatement(logged_batch(ks, "tab", b * 10, partitions_per_batch),
+                                                                 consistency_level=ConsistencyLevel.QUORUM))
+                                   for b in range(nr_batches)])
+
             # Every batch mutation is applied locally, so wait until all of them are blocked.
             async def all_writes_blocked():
                 blocked = len(await log.grep("database_apply: wait", from_mark=mark))
-                return True if blocked >= nr_batches * partitions_per_batch else None
+                return True if blocked >= nr_writes else None
             await wait_for(all_writes_blocked, time.time() + 120, period=0.5)
-            assert not any(f.done() for f in futures)
 
+            # A write handler cancelled after achieving its CL logs this at trace level.
+            await manager.api.set_logger_level(coordinator.ip_addr, "storage_proxy", "trace")
             stop = asyncio.create_task(manager.server_stop_gracefully(coordinator.server_id))
-            await log.wait_for("batchlog_manager - Asked to drain", from_mark=mark, timeout=120)
-            await log.wait_for("batchlog_manager - Drained", from_mark=mark, timeout=120)
+            drain_mark, _ = await log.wait_for("batchlog_manager - Asked to drain", from_mark=mark, timeout=120)
+            drained_mark, _ = await log.wait_for("batchlog_manager - Drained", from_mark=drain_mark, timeout=120)
         finally:
             # Let the blocked local writes finish, so the database drain doesn't wait for them.
             try:
                 await manager.api.message_injection(coordinator.ip_addr, "database_apply")
             except Exception as e:
                 logger.info(f"Failed to message the injection, the node is probably down: {e}")
+            if stop:
+                await stop
 
-        await stop
-
-        # The clients' requests fail (their connection is closed), none of them hangs.
-        results = await asyncio.wait_for(asyncio.gather(*futures, return_exceptions=True), timeout=60)
-        failed = [r for r in results if isinstance(r, Exception)]
-        logger.info(f"{len(failed)} of {len(results)} batches failed, e.g. {failed[:1]!r}")
-        assert len(failed) == len(results)
+        # Count the handlers cancelled between "Asked to drain" and "Drained".
+        cancelled = "Write is not acknowledged by .* replicas after achieving CL"
+        aborted = len(await log.grep(cancelled, from_mark=drain_mark)) - len(await log.grep(cancelled, from_mark=drained_mark))
+        logger.info(f"{aborted} write handlers were aborted by the batchlog manager drain")
+        assert aborted >= nr_writes
 
         await manager.server_start(coordinator.server_id)
         await manager.servers_see_each_other(servers)
